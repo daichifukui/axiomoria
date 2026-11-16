@@ -1,10 +1,24 @@
 #!/usr/bin/env python3
 """Axiomoria: a lightweight scientific-style universe reasoning simulator.
 
-The model is intentionally heuristic. It uses dimensionless multipliers
-relative to the constants in our universe and propagates them through
-interpretable scaling relations. The goal is not precision cosmology, but explicit causal
-reasoning with uncertainty and stated assumptions.
+The model is intentionally heuristic, but it is built on the dimensionless
+combinations of constants that physics actually depends on:
+
+* alpha     -- fine-structure constant (electromagnetic coupling)
+* s         -- strength of the residual strong (nuclear) attraction
+* mu        -- proton-to-electron mass ratio m_p / m_e
+* alpha_G   -- gravitational coupling G m_p^2 / (hbar c)
+
+The six command-line knobs are dimensionless multipliers relative to our
+universe.  They are first mapped onto the couplings above (see
+``effective_parameters``), and every derived quantity is then a function of
+those couplings only.  Each quantity is calibrated so that our universe
+(all multipliers = 1) reproduces familiar values: heaviest stable element
+near lead (Z = 82), deuteron binding 2.22 MeV, neutron-proton mass
+difference 1.29 MeV, primordial helium fraction ~0.25, and so on.
+
+The goal is not precision cosmology but explicit causal reasoning with
+stated assumptions, calibrated thresholds, and honest uncertainty.
 """
 
 from __future__ import annotations
@@ -18,13 +32,55 @@ from typing import Dict, Iterable, List, Sequence, Tuple
 
 EPSILON = 1.0e-12
 
+# ---------------------------------------------------------------------------
+# Reference values for our universe
+# ---------------------------------------------------------------------------
+ALPHA0 = 1.0 / 137.035999          # fine-structure constant
+MU0 = 1836.15267                   # proton / electron mass ratio
+ALPHA_G0 = 5.9e-39                 # G m_p^2 / (hbar c)
+ELECTRON_MASS_MEV = 0.51099895     # m_e c^2
+DEUTERON_BINDING_MEV = 2.224566    # deuteron binding energy
+# Neutron-proton mass difference split into a quark-mass (QCD) part and an
+# electromagnetic self-energy part (Gasser & Leutwyler-style estimate):
+#   m_n - m_p = 2.05 MeV - 0.76 MeV * (alpha / alpha0) = 1.29 MeV today.
+DELTA_NP_QCD_MEV = 2.05
+DELTA_NP_EM_MEV = 0.76
+WEAK_FREEZEOUT_MEV = 0.80          # n/p freeze-out temperature (weak sector held fixed)
+NEUTRON_DECAY_FACTOR = 0.72        # n/p falls from ~1/5 to ~1/7 before nucleosynthesis
+# Strong-force multipliers at which the deuteron unbinds and the diproton binds.
+# Literature estimates range from a few percent to tens of percent depending on
+# the nucleon-nucleon potential used; these are central heuristic values.
+DEUTERON_UNBINDING_STRONG = 0.92
+DIPROTON_BINDING_STRONG = 1.10
+# Finite-nucleus Dirac limit: the 1s level dives into the negative-energy
+# continuum near Z ~ 170 for alpha = alpha0.
+RELATIVISTIC_Z_LIMIT0 = 170.0
+REFERENCE_LIFE_ELEMENT_Z = 26      # iron: heaviest routinely made in stellar burning
+
+# Semi-empirical (liquid-drop) mass formula coefficients in MeV.  The volume
+# term is split into potential attraction minus Fermi kinetic energy so that
+# weakening the strong force erodes binding realistically fast.
+SEMF_VOLUME_POTENTIAL = 37.8
+SEMF_VOLUME_KINETIC = 22.0
+SEMF_SURFACE = 17.8
+SEMF_COULOMB = 0.711
+SEMF_ASYMMETRY_KINETIC = 12.5
+SEMF_ASYMMETRY_POTENTIAL = 11.2
+
+C_CONVENTIONS = ("charges-fixed", "couplings-fixed")
+
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:
     return max(low, min(high, value))
 
 
 def safe_pow(base: float, exponent: float) -> float:
-    return math.exp(exponent * math.log(max(base, EPSILON)))
+    return math.exp(clamp(exponent * math.log(max(base, EPSILON)), -700.0, 700.0))
+
+
+def sigmoid(z: float) -> float:
+    z = clamp(z, -700.0, 700.0)
+    return 1.0 / (1.0 + math.exp(-z))
 
 
 def band_score(value: float, low: float, high: float, softness: float = 0.18) -> float:
@@ -40,6 +96,17 @@ def band_score(value: float, low: float, high: float, softness: float = 0.18) ->
     else:
         distance = abs(math.log(value / max(high, EPSILON)))
     return math.exp(-distance / max(softness, EPSILON))
+
+
+def weighted_geometric_mean(pairs: Sequence[Tuple[float, float]], floor: float = 1.0e-4) -> float:
+    """Combine 0-1 scores so that any failing pillar drags the total down.
+
+    Life needs *all* of its prerequisites; an additive average would let a
+    universe with no chemistry still score highly because its stars are fine.
+    """
+    total_weight = sum(weight for _, weight in pairs)
+    log_sum = sum(weight * math.log(max(score, floor)) for score, weight in pairs)
+    return clamp(math.exp(log_sum / total_weight))
 
 
 @dataclass(frozen=True)
@@ -60,6 +127,147 @@ class Constants:
             "fine_structure": self.fine_structure,
             "proton_electron_mass_ratio": self.proton_electron_mass_ratio,
         }
+
+
+@dataclass(frozen=True)
+class EffectiveParameters:
+    """Dimensionless couplings (as multipliers of our-universe values)."""
+
+    alpha: float          # fine-structure constant / alpha0
+    strong: float         # residual strong attraction / today's
+    electron_mass: float  # m_e relative to the (QCD-fixed) nucleon mass scale
+    mu: float             # (m_p / m_e) / 1836.15
+    alpha_g: float        # G m_p^2 / (hbar c) relative to today's
+    convention: str
+
+    def as_dict(self) -> Dict[str, float]:
+        return {
+            "alpha_multiplier": self.alpha,
+            "strong_coupling_multiplier": self.strong,
+            "electron_mass_multiplier": self.electron_mass,
+            "mu_multiplier": self.mu,
+            "alpha_G_multiplier": self.alpha_g,
+        }
+
+
+def effective_parameters(constants: Constants, convention: str = "charges-fixed") -> EffectiveParameters:
+    """Map the six knobs onto the dimensionless couplings that physics sees.
+
+    Only dimensionless combinations are observable, so dimensional knobs
+    (c, m_e, G) act through them:
+
+    * The nucleon mass is pinned by QCD, so both ``electron_mass`` and
+      ``proton_electron_mass_ratio`` act on m_e relative to m_p:
+      mu = 1836 * ratio / electron_mass.
+    * alpha_G = G m_p^2 / (hbar c) scales as gravity / c.
+    * ``charges-fixed`` (default): changing c with hbar and the gauge charges
+      held fixed rescales every gauge coupling g^2/(hbar c) as 1/c, so
+      alpha -> fine_structure / c and the strong coupling -> strong_force / c.
+    * ``couplings-fixed``: the fine-structure and strong knobs are taken as the
+      final dimensionless couplings, so c only enters through alpha_G.
+    """
+    if convention not in C_CONVENTIONS:
+        raise ValueError(f"unknown c convention {convention!r}")
+    c0 = constants.speed_of_light
+    if convention == "charges-fixed":
+        alpha = constants.fine_structure / c0
+        strong = constants.strong_force / c0
+    else:
+        alpha = constants.fine_structure
+        strong = constants.strong_force
+    electron_mass = constants.electron_mass / constants.proton_electron_mass_ratio
+    return EffectiveParameters(
+        alpha=alpha,
+        strong=strong,
+        electron_mass=electron_mass,
+        mu=1.0 / electron_mass,
+        alpha_g=constants.gravity / c0,
+        convention=convention,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Nuclear physics helpers
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class LiquidDrop:
+    volume: float
+    surface: float
+    coulomb: float
+    asymmetry: float
+
+    @classmethod
+    def for_couplings(cls, strong: float, alpha: float) -> "LiquidDrop":
+        # Nuclear lengths are set by QCD, so Coulomb energy relative to nuclear
+        # energies scales with alpha; attraction (volume, surface, potential
+        # part of asymmetry) scales with the strong multiplier while the Fermi
+        # kinetic energy does not.
+        return cls(
+            volume=SEMF_VOLUME_POTENTIAL * strong - SEMF_VOLUME_KINETIC,
+            surface=SEMF_SURFACE * strong,
+            coulomb=SEMF_COULOMB * alpha,
+            asymmetry=SEMF_ASYMMETRY_KINETIC + SEMF_ASYMMETRY_POTENTIAL * strong,
+        )
+
+    def valley_z(self, mass_number: float) -> float:
+        """Proton number along the valley of beta stability."""
+        return mass_number / (2.0 + self.coulomb / (2.0 * max(self.asymmetry, EPSILON)) * mass_number ** (2.0 / 3.0))
+
+    def binding(self, mass_number: float, z: float) -> float:
+        a = mass_number
+        return (
+            self.volume * a
+            - self.surface * a ** (2.0 / 3.0)
+            - self.coulomb * z * (z - 1.0) / a ** (1.0 / 3.0)
+            - self.asymmetry * (a - 2.0 * z) ** 2 / a
+        )
+
+    def binding_per_nucleon(self, mass_number: float) -> float:
+        return self.binding(mass_number, self.valley_z(mass_number)) / mass_number
+
+
+_REFERENCE_DROP = LiquidDrop.for_couplings(1.0, 1.0)
+_REFERENCE_BINDING_PER_NUCLEON_FE = _REFERENCE_DROP.binding_per_nucleon(56.0)
+# Calibrate the fission-stability limit so that our universe ends at lead.
+_REFERENCE_FISSILITY_LIMIT = _REFERENCE_DROP.valley_z(208.0) ** 2 / 208.0
+
+
+def heaviest_stable_z(drop: LiquidDrop) -> float:
+    """Largest Z along the stability valley that is bound and fission-stable.
+
+    Fission sets in when Z^2/A exceeds a limit proportional to the ratio of
+    surface to Coulomb energy (Bohr-Wheeler fissility).  The limit is
+    calibrated so that the reference universe stops at Z ~ 82.
+    """
+    fissility_limit = _REFERENCE_FISSILITY_LIMIT * (drop.surface / _REFERENCE_DROP.surface) / (
+        drop.coulomb / _REFERENCE_DROP.coulomb
+    )
+    best = 1.0  # a bare proton is always available
+    for mass_number in range(2, 2001):
+        z = drop.valley_z(float(mass_number))
+        if z < 1.0:
+            continue
+        if drop.binding(float(mass_number), z) <= 0.0:
+            continue
+        if z * z / mass_number > fissility_limit:
+            break
+        best = max(best, z)
+    return best
+
+
+def deuteron_binding_mev(strong: float) -> float:
+    """Near-threshold s-wave binding B ~ (s - s_crit)^2 below today's strength.
+
+    Above today's strength the growth is continued logarithmically (same value
+    and slope at s = 1), which tracks a square-well estimate better than the
+    threshold parabola once the state is deeply bound.
+    """
+    x = (strong - DEUTERON_UNBINDING_STRONG) / (1.0 - DEUTERON_UNBINDING_STRONG)
+    if x <= 0.0:
+        return 0.0
+    if x <= 1.0:
+        return DEUTERON_BINDING_MEV * x * x
+    return DEUTERON_BINDING_MEV * (1.0 + 2.0 * math.log(x))
 
 
 @dataclass
@@ -83,6 +291,7 @@ class Hypothesis:
 @dataclass
 class UniverseAssessment:
     constants: Constants
+    effective: EffectiveParameters
     derived: Dict[str, float]
     reasoning_steps: List[str]
     conclusions: List[Conclusion]
@@ -95,8 +304,9 @@ class UniverseAssessment:
 class UniverseReasoner:
     """Propagates altered constants through heuristic physics domains."""
 
-    def __init__(self, constants: Constants) -> None:
+    def __init__(self, constants: Constants, convention: str = "charges-fixed") -> None:
         self.c = constants
+        self.p = effective_parameters(constants, convention)
         self.steps: List[str] = []
 
     def analyze(self) -> UniverseAssessment:
@@ -105,9 +315,10 @@ class UniverseReasoner:
         hypotheses = self.compare_hypotheses(derived)
         universe_class, class_confidence = self.classify(derived, hypotheses)
         confidence = self.overall_confidence(derived, class_confidence)
-        uncertainties = self.key_uncertainties(derived)
+        uncertainties = self.key_uncertainties(derived, hypotheses)
         return UniverseAssessment(
             constants=self.c,
+            effective=self.p,
             derived=derived,
             reasoning_steps=self.steps,
             conclusions=conclusions,
@@ -118,171 +329,282 @@ class UniverseReasoner:
         )
 
     def derive_quantities(self) -> Dict[str, float]:
-        sf = self.c.strong_force
-        c0 = self.c.speed_of_light
-        me = self.c.electron_mass
-        g = self.c.gravity
-        alpha = self.c.fine_structure
-        mu = self.c.proton_electron_mass_ratio
+        alpha = self.p.alpha
+        strong = self.p.strong
+        me = self.p.electron_mass
+        mu = self.p.mu
+        alpha_g = self.p.alpha_g
 
-        # Nuclear binding rises with the strong interaction, but is eroded by
-        # electromagnetic repulsion. The c multiplier is included because rest
-        # energy and relativistic nuclear scales alter the effective mass defect.
-        coulomb_pressure = safe_pow(alpha, 1.55) / safe_pow(sf, 0.75)
-        nuclear_binding_margin = safe_pow(sf, 1.85) * safe_pow(c0, 0.25) - 0.34 * coulomb_pressure
-        isotope_stability_index = clamp((nuclear_binding_margin - 0.42) / 1.65)
-        maximum_stable_atomic_number = 82.0 * safe_pow(max(nuclear_binding_margin, 0.05), 0.72) / safe_pow(alpha, 0.58)
+        # --- Nuclear structure -------------------------------------------
+        drop = LiquidDrop.for_couplings(strong, alpha)
+        nuclear_binding_margin = drop.binding_per_nucleon(56.0) / _REFERENCE_BINDING_PER_NUCLEON_FE
+        coulomb_pressure = (drop.coulomb / drop.surface) / (_REFERENCE_DROP.coulomb / _REFERENCE_DROP.surface)
+        maximum_stable_atomic_number = heaviest_stable_z(drop)
 
-        # Hydrogen burning requires deuterium-like bottlenecks to be neither too
-        # weak nor too easy; both extremes shorten the window for ordinary stars.
-        deuterium_bottleneck = safe_pow(sf, 2.15) / (safe_pow(alpha, 0.35) * safe_pow(c0, 0.20))
-        fusion_threshold_scale = safe_pow(alpha, 2.0) * safe_pow(me, 0.18) / safe_pow(sf, 1.25)
+        deuteron_binding = deuteron_binding_mev(strong)
+        deuteron_bound_score = sigmoid((strong - DEUTERON_UNBINDING_STRONG) / 0.01)
+        diproton_threshold = DIPROTON_BINDING_STRONG + 0.03 * (alpha - 1.0)
+        diproton_bound_score = sigmoid((strong - diproton_threshold) / 0.01)
 
-        # Bohr-like radius scaling: a0 ∝ 1/(alpha * reduced mass). The
-        # proton-electron mass-ratio multiplier changes reduced-mass corrections
-        # for light atoms without pretending to solve full molecular spectra.
-        reduced_mass_scale = me * (mu * 1836.0 + 1.0) / (mu * 1836.0 + me)
+        # --- Weak-interaction stability ----------------------------------
+        neutron_proton_gap = DELTA_NP_QCD_MEV - DELTA_NP_EM_MEV * alpha
+        electron_rest_energy = ELECTRON_MASS_MEV * me
+        # Hydrogen survives electron capture (p + e -> n + nu) only if m_e < m_n - m_p.
+        hydrogen_stability_margin = neutron_proton_gap - electron_rest_energy
+        # Deuterium survives beta decay (d -> p + p + e + nu) only if m_n - m_p < B_d + m_e.
+        deuteron_beta_margin = deuteron_binding + electron_rest_energy - neutron_proton_gap
+        weak_stability_score = sigmoid(hydrogen_stability_margin / 0.05)
+        deuteron_available = deuteron_bound_score * sigmoid(deuteron_beta_margin / 0.1)
+        neutron_decays = sigmoid(hydrogen_stability_margin / 0.05)
+
+        # --- Big-bang nucleosynthesis -------------------------------------
+        np_ratio = math.exp(clamp(-neutron_proton_gap / WEAK_FREEZEOUT_MEV, -700.0, 50.0))
+        np_ratio *= 1.0 - (1.0 - NEUTRON_DECAY_FACTOR) * neutron_decays
+        proton_fraction = 1.0 / (1.0 + np_ratio)
+        neutron_fraction = np_ratio / (1.0 + np_ratio)
+        light_element_path = max(deuteron_available, diproton_bound_score)
+        locked_pairs = min(proton_fraction, neutron_fraction) * light_element_path
+        primordial_helium_fraction = 2.0 * locked_pairs
+        leftover_neutrons = neutron_fraction - locked_pairs
+        primordial_hydrogen_fraction = (proton_fraction - locked_pairs) + leftover_neutrons * neutron_decays
+        # A bound diproton opens a fast strong/EM channel that burns extra hydrogen
+        # (Dyson's argument; later work finds the depletion is partial, not total).
+        primordial_hydrogen_fraction *= 1.0 - 0.5 * diproton_bound_score
+        hydrogen_availability = band_score(primordial_hydrogen_fraction, 0.3, 1.0, 0.5) * weak_stability_score
+
+        # --- Atoms --------------------------------------------------------
+        reduced_mass_scale = me * (MU0 + 1.0) / (MU0 + me)
+        # Bohr radius relative to nuclear (QCD) length: a0 / r_N ~ m_p / (alpha m_e).
         atomic_radius_scale = 1.0 / max(alpha * reduced_mass_scale, EPSILON)
-        atomic_energy_scale = safe_pow(alpha, 2.0) * reduced_mass_scale * safe_pow(c0, 2.0)
-        relativistic_stiffness = alpha / max(c0, EPSILON)
-        bound_state_stability = band_score(relativistic_stiffness, 0.15, 1.45, 0.45) * band_score(
-            atomic_energy_scale, 0.08, 18.0, 0.55
+        # Rydberg energy relative to the nucleon rest energy: alpha^2 m_e / m_p.
+        atomic_energy_scale = alpha * alpha * reduced_mass_scale
+        # Z*alpha for iron: the 1s electron speed as a fraction of c.
+        relativistic_stiffness = REFERENCE_LIFE_ELEMENT_Z * ALPHA0 * alpha
+        relativistic_element_limit = RELATIVISTIC_Z_LIMIT0 / max(alpha, EPSILON)
+        # Zero-point motion of nuclei relative to bond length ~ (m_e/m_p)^(1/4);
+        # well-defined molecular shapes and solids need it to be small.
+        nuclear_delocalization = safe_pow(me / MU0, 0.25)
+        bound_state_stability = (
+            band_score(relativistic_element_limit, 30.0, math.inf, 0.35)
+            * band_score(nuclear_delocalization, EPSILON, 0.25, 0.30)
+            * band_score(atomic_radius_scale, 0.03, math.inf, 0.60)
         )
 
-        # Chemical diversity favors moderate atom sizes, enough stable nuclei,
-        # and non-extreme relativistic electron behavior.
-        chemistry_viability_score = clamp(
-            0.42 * isotope_stability_index
-            + 0.25 * band_score(atomic_radius_scale, 0.18, 7.5, 0.60)
-            + 0.23 * bound_state_stability
-            + 0.10 * band_score(maximum_stable_atomic_number / 82.0, 0.35, 2.2, 0.45)
+        periodic_table_reach = min(maximum_stable_atomic_number, relativistic_element_limit)
+        element_reach_score = band_score(periodic_table_reach, REFERENCE_LIFE_ELEMENT_Z, math.inf, 0.60)
+        isotope_stability_index = element_reach_score * clamp(nuclear_binding_margin / 0.5)
+
+        # --- Stars ----------------------------------------------------------
+        stellar_mass_scale = safe_pow(alpha_g, -1.5)
+        fusion_efficiency_scale = max(nuclear_binding_margin, 1.0e-3)
+        # Main-sequence lifetime (Carr & Rees): t ~ eps alpha^2 alpha_G^-1 mu^2 hbar/(m_p c^2).
+        # Expressed in atomic (chemical) time units hbar/(alpha^2 m_e c^2):
+        # t / t_atomic ~ eps alpha^4 alpha_G^-1 mu.
+        stellar_lifetime_scale = fusion_efficiency_scale * safe_pow(alpha, 4.0) / max(alpha_g, EPSILON) * mu
+        stellar_burn_rate_scale = 1.0 / max(stellar_lifetime_scale, EPSILON)
+        # Gamow energy of p+p relative to m_e c^2 ~ alpha^2 mu: ignition must
+        # happen before electron degeneracy halts contraction.
+        fusion_threshold_scale = alpha * alpha * mu
+        ignition_score = band_score(fusion_threshold_scale, EPSILON, 100.0, 0.8)
+        hydrogen_burning_score = max(deuteron_available, diproton_bound_score) * ignition_score
+        long_lived_star_score = hydrogen_burning_score * band_score(stellar_lifetime_scale, 0.3, math.inf, 0.7)
+        # Carter's coincidence alpha_G ~ alpha^12 (m_e/m_p)^4 marks the boundary
+        # between convective and radiative stars; far from it stars are all one type.
+        carter_ratio = alpha_g * safe_pow(mu, 4.0) / safe_pow(alpha, 12.0)
+        stellar_diversity_score = band_score(carter_ratio, 0.01, 100.0, 1.5)
+        # Carr-Rees weak/gravity coincidence for neutrino-driven supernovae
+        # (weak coupling held fixed): G_F m_e^2 ~ (G m_e^2 / hbar c)^(1/4).
+        weak_gravity_ratio = safe_pow(me, 1.5) / safe_pow(alpha_g, 0.25)
+        supernova_enrichment_score = band_score(weak_gravity_ratio, 1.0 / 3.0, 3.0, 0.6)
+        nucleosynthesis_score = hydrogen_burning_score * (0.6 + 0.4 * supernova_enrichment_score)
+
+        # --- Chemistry --------------------------------------------------------
+        chemistry_viability_score = weighted_geometric_mean(
+            [
+                (isotope_stability_index, 0.35),
+                (bound_state_stability, 0.30),
+                (weak_stability_score, 0.20),
+                (nucleosynthesis_score, 0.15),
+            ]
         )
 
-        # Stellar rates are intentionally semi-continuous. Stronger gravity and
-        # easier fusion raise luminosity; lower c changes rest-energy yield.
-        stellar_burn_rate_scale = safe_pow(g, 1.75) * safe_pow(fusion_threshold_scale, -1.25) / safe_pow(c0, 1.15)
-        stellar_lifetime_scale = safe_pow(c0, 2.0) / max(stellar_burn_rate_scale, EPSILON)
-        hydrogen_consumption_intensity = safe_pow(stellar_burn_rate_scale, 0.65) * safe_pow(deuterium_bottleneck, 0.25)
-        supernova_tendency = clamp(
-            0.30 * math.log1p(maximum_stable_atomic_number / 82.0)
-            + 0.34 * safe_pow(g, 0.72)
-            + 0.22 * safe_pow(sf, 0.58)
-            + 0.14 / safe_pow(c0, 0.85)
-            - 0.45
+        # --- Structure formation ----------------------------------------------
+        # Rees-Ostriker cooling: stars per galaxy ~ alpha^5 alpha_G^-1/2 mu^1/2 (~1e10 today).
+        galaxy_star_count_scale = safe_pow(alpha, 5.0) * safe_pow(alpha_g, -0.5) * safe_pow(mu, 0.5)
+        structure_formation_plausibility = band_score(galaxy_star_count_scale, 1.0e-5, math.inf, 1.2)
+
+        life_permitting_score = weighted_geometric_mean(
+            [
+                (chemistry_viability_score, 0.35),
+                (long_lived_star_score, 0.25),
+                (hydrogen_availability, 0.15),
+                (structure_formation_plausibility, 0.15),
+                (0.5 + 0.5 * stellar_diversity_score, 0.10),
+            ]
         )
 
-        # Cosmological structure is favored by gravity that can collect matter,
-        # a causal horizon that is not too restrictive, and long-lived stars.
-        causality_limit_scale = c0 / math.sqrt(max(g, EPSILON))
-        flatness_stability_score = band_score(g / safe_pow(c0, 4.0), 0.08, 12.0, 0.75)
-        structure_formation_plausibility = clamp(
-            0.40 * band_score(g, 0.05, 18.0, 0.75)
-            + 0.25 * band_score(causality_limit_scale, 0.12, 8.0, 0.70)
-            + 0.20 * flatness_stability_score
-            + 0.15 * band_score(stellar_lifetime_scale, 0.02, 100.0, 0.90)
+        threshold_proximity = max(
+            math.exp(-abs(strong - DEUTERON_UNBINDING_STRONG) / 0.02),
+            math.exp(-abs(strong - diproton_threshold) / 0.02),
+            math.exp(-abs(hydrogen_stability_margin) / 0.10),
+            math.exp(-abs(deuteron_beta_margin) / 0.20) * deuteron_bound_score,
         )
-        long_lived_star_score = band_score(stellar_lifetime_scale, 0.25, 80.0, 0.70) * band_score(
-            hydrogen_consumption_intensity, 0.12, 12.0, 0.55
-        )
-        life_permitting_score = clamp(
-            0.34 * chemistry_viability_score
-            + 0.26 * long_lived_star_score
-            + 0.20 * structure_formation_plausibility
-            + 0.12 * flatness_stability_score
-            + 0.08 * bound_state_stability
-        )
-
-        reliable_regime_score = self.reliable_regime_score()
 
         derived = {
-            "coulomb_pressure": coulomb_pressure,
             "nuclear_binding_margin": nuclear_binding_margin,
-            "isotope_stability_index": isotope_stability_index,
+            "coulomb_pressure": coulomb_pressure,
             "maximum_stable_atomic_number": maximum_stable_atomic_number,
-            "deuterium_bottleneck": deuterium_bottleneck,
-            "fusion_threshold_scale": fusion_threshold_scale,
+            "isotope_stability_index": isotope_stability_index,
+            "deuteron_binding_mev": deuteron_binding,
+            "deuteron_bound_score": deuteron_bound_score,
+            "diproton_bound_score": diproton_bound_score,
+            "neutron_proton_gap_mev": neutron_proton_gap,
+            "hydrogen_stability_margin_mev": hydrogen_stability_margin,
+            "deuteron_beta_margin_mev": deuteron_beta_margin,
+            "weak_stability_score": weak_stability_score,
+            "primordial_helium_fraction": primordial_helium_fraction,
+            "primordial_hydrogen_fraction": primordial_hydrogen_fraction,
+            "hydrogen_availability": hydrogen_availability,
             "reduced_mass_scale": reduced_mass_scale,
             "atomic_radius_scale": atomic_radius_scale,
             "atomic_energy_scale": atomic_energy_scale,
             "relativistic_stiffness": relativistic_stiffness,
+            "relativistic_element_limit": relativistic_element_limit,
+            "nuclear_delocalization": nuclear_delocalization,
             "bound_state_stability": bound_state_stability,
-            "stellar_burn_rate_scale": stellar_burn_rate_scale,
+            "periodic_table_reach": periodic_table_reach,
+            "stellar_mass_scale": stellar_mass_scale,
+            "fusion_efficiency_scale": fusion_efficiency_scale,
+            "fusion_threshold_scale": fusion_threshold_scale,
+            "hydrogen_burning_score": hydrogen_burning_score,
             "stellar_lifetime_scale": stellar_lifetime_scale,
-            "hydrogen_consumption_intensity": hydrogen_consumption_intensity,
-            "supernova_tendency": supernova_tendency,
-            "causality_limit_scale": causality_limit_scale,
-            "flatness_stability_score": flatness_stability_score,
+            "stellar_burn_rate_scale": stellar_burn_rate_scale,
+            "long_lived_star_score": long_lived_star_score,
+            "carter_ratio": carter_ratio,
+            "stellar_diversity_score": stellar_diversity_score,
+            "weak_gravity_ratio": weak_gravity_ratio,
+            "supernova_enrichment_score": supernova_enrichment_score,
+            "nucleosynthesis_score": nucleosynthesis_score,
+            "galaxy_star_count_scale": galaxy_star_count_scale,
             "structure_formation_plausibility": structure_formation_plausibility,
             "chemistry_viability_score": chemistry_viability_score,
-            "long_lived_star_score": long_lived_star_score,
             "life_permitting_score": life_permitting_score,
-            "reliable_regime_score": reliable_regime_score,
+            "threshold_proximity": threshold_proximity,
+            "reliable_regime_score": self.reliable_regime_score(),
         }
 
         self.steps.extend(
             [
-                "Strong-force and electromagnetic multipliers were combined into a nuclear binding margin: stronger attraction increases mass-defect binding, while fine-structure pressure penalizes large nuclei.",
-                "Atomic length and energy scales were inferred from Bohr-like scalings: radius varies as 1/(alpha * reduced mass), while electronic binding energy varies as alpha^2 * reduced mass * c^2.",
-                "Relativistic stiffness was estimated from alpha/c; high values imply electrons and nuclear processes feel stronger relativistic corrections and may destabilize ordinary bound states.",
-                "Fusion thresholds and stellar burn rates were propagated from nuclear binding, gravity, and c-dependent energy release rather than assigned as fixed outcomes.",
-                "Cosmological viability was estimated by combining causal horizon scale, gravity-driven structure formation, flatness sensitivity, and the availability of long-lived stars.",
+                "The six knobs were mapped onto dimensionless couplings (alpha, strong coupling, "
+                f"m_p/m_e, alpha_G) under the '{self.p.convention}' convention, because only "
+                "dimensionless combinations of constants are physically observable.",
+                "Nuclear binding was estimated with a liquid-drop mass formula: attraction scales with "
+                "the strong coupling, Fermi kinetic energy does not, and Coulomb repulsion scales with "
+                "alpha. The heaviest stable element follows from the fission (Z^2/A) limit, calibrated to lead.",
+                "Two-nucleon thresholds were checked: the deuteron unbinds if the strong force weakens by "
+                "~8%, and the diproton binds if it strengthens by ~10%.",
+                "Weak-interaction stability compared the electron mass with the neutron-proton mass "
+                "difference (quark-mass part minus electromagnetic part): hydrogen must not decay by "
+                "electron capture, and deuterium must not beta-decay.",
+                "Primordial composition followed from neutron-proton freeze-out, neutron decay, and "
+                "whether a deuteron (or diproton) path exists to lock neutrons into helium.",
+                "Atomic scales used Bohr-like scaling relative to nuclear size (a0/r_N ~ m_p/(alpha m_e)), "
+                "the Dirac Z*alpha limit, and Born-Oppenheimer separation ~(m_e/m_p)^(1/4).",
+                "Stellar lifetimes used the Carr-Rees scaling eps*alpha^2*alpha_G^-1*(m_p/m_e)^2, measured "
+                "in atomic (chemical) time units, with ignition requiring a modest Gamow energy.",
+                "Structure formation used the Rees-Ostriker cooling argument (stars per galaxy), and the "
+                "life-permitting score is a weighted geometric mean so that any failed pillar dominates.",
             ]
         )
         return derived
 
     def reliable_regime_score(self) -> float:
-        values = list(self.c.as_dict().values())
-        # Highest confidence near 1; decay when any knob leaves roughly two
-        # orders of magnitude around our universe.
-        worst_log = max(abs(math.log10(max(v, EPSILON))) for v in values)
-        return clamp(1.0 - max(0.0, worst_log - 0.45) / 1.55)
+        # Each coupling is trusted over a different range: the nuclear thresholds
+        # are calibrated only within ~20% of today's strong force, while the
+        # gravitational scaling laws hold over many orders of magnitude.
+        tolerances = [
+            (self.p.strong, 0.08),
+            (self.p.alpha, 0.30),
+            (self.p.electron_mass, 0.45),
+            (self.p.alpha_g, 2.0),
+        ]
+        worst = max(abs(math.log10(max(value, EPSILON))) / tolerance for value, tolerance in tolerances)
+        return clamp(1.0 - max(0.0, worst - 1.0) / 3.5)
 
     def build_conclusions(self, d: Dict[str, float]) -> List[Conclusion]:
+        regime = d["reliable_regime_score"]
         return [
             Conclusion(
                 title="Nuclear structure",
                 statement=(
-                    f"The model estimates a nuclear binding margin of {d['nuclear_binding_margin']:.3g} "
-                    f"and a maximum stable atomic number near {d['maximum_stable_atomic_number']:.0f}."
+                    f"Binding per nucleon (iron) is {d['nuclear_binding_margin']:.3g}x today's; the heaviest "
+                    f"stable element is near Z = {d['maximum_stable_atomic_number']:.0f}. The deuteron "
+                    f"binding is {d['deuteron_binding_mev']:.3g} MeV and the diproton is "
+                    f"{'bound' if d['diproton_bound_score'] > 0.5 else 'unbound'}."
                 ),
                 chain=[
-                    "Increasing strong-force strength raises the attractive part of the nuclear potential.",
-                    "Increasing fine-structure strength raises Coulomb repulsion among protons.",
-                    "The balance sets isotope stability and the approximate reach of the periodic table.",
+                    "A stronger nuclear attraction deepens the potential well, while nucleon kinetic energy is unchanged.",
+                    "A larger fine-structure constant raises Coulomb repulsion among protons and lowers the fission limit Z^2/A.",
+                    "Two-nucleon states sit close to threshold, so modest strong-force changes unbind deuterium or bind the diproton.",
                 ],
-                confidence=0.72 * d["reliable_regime_score"],
-                assumptions=["Liquid-drop-like scaling is used for heavy nuclei.", "Weak-interaction details are compressed into the deuterium bottleneck proxy."],
-                limitations=["Does not solve nuclear shell structure or beta-decay networks."],
+                confidence=0.72 * regime,
+                assumptions=[
+                    "Liquid-drop scaling is used for heavy nuclei.",
+                    "Nucleon mass and nuclear radii are held fixed by QCD.",
+                ],
+                limitations=[
+                    "No shell structure, alpha-decay networks, or Hoyle-state (carbon resonance) tuning.",
+                    "Deuteron/diproton thresholds are model-dependent in the literature.",
+                ],
+            ),
+            Conclusion(
+                title="Weak stability and primordial composition",
+                statement=(
+                    f"m_n - m_p = {d['neutron_proton_gap_mev']:.3g} MeV, leaving a hydrogen stability margin of "
+                    f"{d['hydrogen_stability_margin_mev']:.3g} MeV; big-bang nucleosynthesis leaves a hydrogen "
+                    f"mass fraction of {d['primordial_hydrogen_fraction']:.2f}."
+                ),
+                chain=[
+                    "The neutron-proton mass difference is a quark-mass contribution minus an electromagnetic one.",
+                    "If the electron outweighs that difference, hydrogen atoms convert to neutrons by electron capture.",
+                    "Neutrons that survive freeze-out are locked into helium only if deuterium is a stable stepping stone.",
+                ],
+                confidence=0.62 * regime,
+                assumptions=["Quark masses, the weak coupling, and the freeze-out temperature are held fixed."],
+                limitations=["The electromagnetic share of m_n - m_p carries roughly 30% uncertainty."],
             ),
             Conclusion(
                 title="Atomic and chemical behavior",
                 statement=(
-                    f"Atomic radius is scaled by {d['atomic_radius_scale']:.3g}; chemistry viability is "
+                    f"Atoms are {d['atomic_radius_scale']:.3g}x today's size relative to nuclei; elements "
+                    f"remain non-relativistic up to Z ~ {d['relativistic_element_limit']:.0f}; chemistry viability is "
                     f"{d['chemistry_viability_score']:.2f} on a 0-1 heuristic scale."
                 ),
                 chain=[
-                    "Larger electron reduced mass or fine-structure coupling shrinks Bohr-like orbitals.",
-                    "The relativistic stiffness proxy alpha/c tests whether electrons remain in ordinary non-collapse bound states.",
-                    "Chemical complexity requires stable nuclei plus a moderate range of molecular bond lengths and energies.",
+                    "A heavier electron or larger alpha shrinks Bohr orbits relative to the nucleus.",
+                    "Z*alpha sets the speed of inner electrons; near Z*alpha ~ 1 bound states collapse into the Dirac sea.",
+                    "Molecular structure requires nuclei far heavier than electrons, so that their zero-point motion stays small.",
+                    "Chemical complexity requires stable nuclei up to at least the CNO and iron group, made in stars.",
                 ],
-                confidence=0.70 * d["reliable_regime_score"],
+                confidence=0.70 * regime,
                 assumptions=["Chemistry is approximated by hydrogenic scaling plus nuclear diversity."],
                 limitations=["Molecular orbital calculations are not performed."],
             ),
             Conclusion(
                 title="Stellar evolution",
                 statement=(
-                    f"Stellar burn rate scales as {d['stellar_burn_rate_scale']:.3g}, giving a lifetime scale of "
-                    f"{d['stellar_lifetime_scale']:.3g}; supernova tendency is {d['supernova_tendency']:.2f}."
+                    f"Main-sequence lifetime (in chemical time units) scales by {d['stellar_lifetime_scale']:.3g}; "
+                    f"typical stellar mass by {d['stellar_mass_scale']:.3g}; hydrogen burning score is "
+                    f"{d['hydrogen_burning_score']:.2f}; Carter's convective/radiative ratio is {d['carter_ratio']:.3g}."
                 ),
                 chain=[
-                    "Fusion ignition responds to Coulomb barriers, nuclear attraction, and stellar compression from gravity.",
-                    "Burn rate is increased by stronger gravity or easier fusion thresholds.",
-                    "Lifetime is penalized when fuel consumption rises faster than available rest-energy yield.",
+                    "Stellar masses are set by alpha_G^-3/2 nucleon masses, so stronger gravity makes smaller stars.",
+                    "Luminosity is limited by photon diffusion (Thomson opacity), giving lifetimes ~ eps alpha^2 / (alpha_G beta^2).",
+                    "Hydrogen burning needs a stable deuteron (or bound diproton) and a Gamow barrier low enough to ignite before degeneracy.",
                 ],
-                confidence=0.58 * d["reliable_regime_score"],
+                confidence=0.58 * regime,
                 assumptions=["Main-sequence-like stars are treated through scaling laws, not stellar structure equations."],
-                limitations=["Metallicity, opacity, and detailed reaction chains are not simulated."],
+                limitations=["Metallicity, opacity details, and reaction networks are not simulated."],
             ),
             Conclusion(
                 title="Cosmology and life-permitting conditions",
@@ -291,59 +613,81 @@ class UniverseReasoner:
                     f"life-permitting score is {d['life_permitting_score']:.2f}."
                 ),
                 chain=[
-                    "Gravity must be strong enough to seed structures but not so dominant that rapid collapse erases stable eras.",
-                    "Speed of light sets causal communication and the energetic scale E = mc^2.",
-                    "Life-friendliness combines stable chemistry, long-lived stars, and cosmological structure formation.",
+                    "Gas must cool within a free-fall time to fragment into galaxies of many stars (Rees-Ostriker).",
+                    "Under the charges-fixed convention, slower light strengthens every gauge coupling and gravity alike.",
+                    "Life-friendliness requires stable chemistry, hydrogen, long-lived stars, and cosmic structure together.",
                 ],
-                confidence=0.52 * d["reliable_regime_score"],
-                assumptions=["Initial perturbation amplitude and dark-sector physics are held fixed."],
+                confidence=0.52 * regime,
+                assumptions=["Primordial fluctuation amplitude, dark matter, baryon asymmetry, and dark energy are held fixed."],
                 limitations=["No numerical Friedmann evolution or galaxy formation simulation is included."],
             ),
         ]
 
     def compare_hypotheses(self, d: Dict[str, float]) -> List[Hypothesis]:
-        nuclear_matter = clamp(0.55 * clamp((self.c.strong_force - 1.25) / 1.4) + 0.30 * d["isotope_stability_index"] + 0.15 * clamp((d["nuclear_binding_margin"] - 1.7) / 2.5))
-        exotic_atoms = clamp(0.55 * (1.0 - d["bound_state_stability"]) + 0.25 * clamp(abs(math.log(max(d["atomic_radius_scale"], EPSILON))) / 2.4) + 0.20 * clamp(d["relativistic_stiffness"] / 2.0))
-        short_lived = clamp(0.45 * (1.0 - d["long_lived_star_score"]) + 0.35 * clamp(math.log1p(d["stellar_burn_rate_scale"]) / 4.0) + 0.20 * d["supernova_tendency"])
         stable_life = d["life_permitting_score"] * d["reliable_regime_score"]
-        causality = clamp(0.65 * (1.0 - band_score(d["causality_limit_scale"], 0.2, 6.0, 0.65)) + 0.35 * clamp(d["relativistic_stiffness"] / 2.0))
-        nonviable = clamp(1.0 - d["life_permitting_score"] + 0.25 * (1.0 - d["structure_formation_plausibility"]))
+        exotic_atoms = clamp(
+            0.60 * (1.0 - d["bound_state_stability"])
+            + 0.20 * clamp(abs(math.log(max(d["atomic_radius_scale"], EPSILON))) / 2.4)
+            + 0.20 * clamp((d["relativistic_stiffness"] - REFERENCE_LIFE_ELEMENT_Z * ALPHA0) / 0.8)
+        )
+        short_lived = clamp(
+            d["hydrogen_burning_score"]
+            * (
+                0.60 * (1.0 - band_score(d["stellar_lifetime_scale"], 0.3, math.inf, 0.7))
+                + 0.25 * clamp(math.log10(max(self.p.alpha_g, EPSILON)) / 3.0)
+                + 0.15 * (1.0 - d["stellar_diversity_score"])
+            )
+        )
+        nuclear_matter = clamp(
+            0.45 * d["diproton_bound_score"]
+            + 0.30 * clamp((self.p.strong - DIPROTON_BINDING_STRONG) / 0.6)
+            + 0.25 * clamp(math.log(max(d["maximum_stable_atomic_number"], 1.0) / 82.0) / math.log(3.0))
+        )
+        hydrogen_unstable = clamp(0.85 * (1.0 - d["weak_stability_score"]) + 0.15 * (1.0 - d["hydrogen_availability"]))
+        nucleosynthesis_starved = clamp(0.80 * (1.0 - d["hydrogen_burning_score"]) + 0.20 * (1.0 - d["isotope_stability_index"]))
+        nonviable = clamp(0.85 * (1.0 - d["life_permitting_score"]) + 0.10 * (1.0 - d["structure_formation_plausibility"]))
 
         return [
             Hypothesis(
                 "stable-life-friendly universe",
                 stable_life,
-                ["Chemistry, long-lived stars, and structure formation retain jointly high scores."],
+                ["Chemistry, hydrogen, long-lived stars, and structure formation retain jointly high scores."],
                 ["Heuristic model cannot guarantee biochemistry or planet formation."],
             ),
             Hypothesis(
                 "exotic-atom universe",
                 exotic_atoms,
-                ["Atomic radius, binding energy, or relativistic stiffness deviate from the ordinary chemistry band."],
+                ["Atomic size, Z*alpha relativistic collapse, or nuclear zero-point motion leave the ordinary chemistry band."],
                 ["Some alternative chemistry may still exist if nuclear diversity is high."],
             ),
             Hypothesis(
-                "short-lived-high-density universe",
+                "short-lived-star universe",
                 short_lived,
-                ["Fast stellar burning, stronger gravity, or high supernova tendency compress the habitable time window."],
+                ["Stronger gravity or weaker radiative trapping shortens stellar lifetimes relative to chemical timescales."],
                 ["Low-mass or nonstandard stars could extend lifetimes outside this scaling model."],
             ),
             Hypothesis(
                 "nuclear-matter-dominated universe",
                 nuclear_matter,
-                ["High strong-force binding can over-stabilize heavy nuclei and favor dense nuclear aggregates."],
-                ["Coulomb pressure and shell effects may still prevent bulk nuclear domination."],
+                ["A bound diproton or much stronger nuclear attraction burns hydrogen early and over-stabilizes heavy nuclei."],
+                ["Later studies find bound-diproton universes can still keep hydrogen and stable stars."],
             ),
             Hypothesis(
-                "causality-distorted universe",
-                causality,
-                ["The causal horizon proxy or relativistic stiffness lies outside the ordinary range."],
-                ["Changing units versus changing physical dimensionless ratios can be subtle for c-like inputs."],
+                "hydrogen-unstable universe",
+                hydrogen_unstable,
+                ["The electron outweighs the neutron-proton mass difference, so hydrogen captures its electron and becomes a neutron."],
+                ["The capture rate could be slow if the margin is tiny; the EM share of m_n - m_p is uncertain."],
+            ),
+            Hypothesis(
+                "nucleosynthesis-starved universe",
+                nucleosynthesis_starved,
+                ["Without a stable deuteron (or ignitable fusion), stars cannot burn hydrogen and the universe stays nearly pure hydrogen."],
+                ["Exotic burning channels not modelled here might partially substitute."],
             ),
             Hypothesis(
                 "non-viable universe",
                 nonviable,
-                ["One or more required pillars—stable atoms, stars, or structure—has a low combined score."],
+                ["One or more required pillars - stable atoms, hydrogen, stars, or structure - has a low combined score."],
                 ["The model may miss exotic viable regimes unrelated to Earth-like life."],
             ),
         ]
@@ -357,16 +701,31 @@ class UniverseReasoner:
         return top.name, confidence
 
     def overall_confidence(self, d: Dict[str, float], class_confidence: float) -> float:
-        return clamp(0.55 * class_confidence + 0.45 * d["reliable_regime_score"])
+        return clamp(0.55 * class_confidence + 0.45 * d["reliable_regime_score"] - 0.20 * d["threshold_proximity"])
 
-    def key_uncertainties(self, d: Dict[str, float]) -> List[str]:
+    def key_uncertainties(self, d: Dict[str, float], hypotheses: Sequence[Hypothesis]) -> List[str]:
         uncertainties = [
-            "Heuristic exponents are calibrated for qualitative reasoning near our universe, not precision prediction.",
-            "Weak force, quark masses, baryon asymmetry, dark matter, and primordial fluctuation amplitude are held fixed.",
+            "Heuristic exponents and thresholds are calibrated for qualitative reasoning near our universe, not precision prediction.",
+            "Weak coupling, quark masses, baryon asymmetry, dark matter, dark energy, and primordial fluctuation amplitude are held fixed.",
         ]
+        if self.c.speed_of_light != 1.0:
+            uncertainties.append(
+                "Changing c is convention-dependent: under 'charges-fixed' it rescales all gauge couplings as 1/c; "
+                "under 'couplings-fixed' it only changes alpha_G. Use --c-convention to compare."
+            )
         if d["reliable_regime_score"] < 0.65:
-            uncertainties.append("At least one input lies outside the reliable near-reference regime; confidence is degraded.")
-        close_hypotheses = sorted(self.compare_hypotheses(d), key=lambda h: h.plausibility, reverse=True)[:2]
+            uncertainties.append("At least one coupling lies outside the reliable near-reference regime; confidence is degraded.")
+        if d["threshold_proximity"] > 0.3:
+            uncertainties.append(
+                "The universe sits near a sharp threshold (deuteron/diproton binding or hydrogen/deuterium weak stability); "
+                "small model errors could flip the outcome."
+            )
+        if abs(math.log(self.p.strong)) > 0.005 or abs(math.log(self.p.alpha)) > 0.02:
+            uncertainties.append(
+                "Carbon and oxygen yields depend on the Hoyle resonance, which shifts with percent-level changes in the "
+                "strong force or alpha; this is not modelled."
+            )
+        close_hypotheses = sorted(hypotheses, key=lambda h: h.plausibility, reverse=True)[:2]
         if len(close_hypotheses) == 2 and abs(close_hypotheses[0].plausibility - close_hypotheses[1].plausibility) < 0.12:
             uncertainties.append(
                 f"Top hypotheses are close: {close_hypotheses[0].name} versus {close_hypotheses[1].name}."
@@ -379,39 +738,61 @@ def positive_float(text: str) -> float:
         value = float(text)
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"{text!r} is not a number") from exc
-    if value <= 0:
-        raise argparse.ArgumentTypeError("constant multipliers must be positive")
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError("constant multipliers must be positive and finite")
     return value
 
 
 def format_float(value: float) -> str:
-    if abs(value) >= 1000 or abs(value) < 0.01:
+    if value != 0.0 and (abs(value) >= 1000 or abs(value) < 0.01):
         return f"{value:.3e}"
     return f"{value:.3f}"
 
 
 def wrap_lines(lines: Iterable[str], indent: str = "  ", width: int = 88) -> str:
-    return "\n".join(textwrap.fill(line, width=width, initial_indent=indent, subsequent_indent=indent) for line in lines)
+    return "\n".join(textwrap.fill(line, width=width, initial_indent=indent, subsequent_indent=indent + "  ") for line in lines)
 
 
-def render_report(assessment: UniverseAssessment, verbose: bool = False) -> str:
+CORE_KEYS = [
+    "nuclear_binding_margin",
+    "maximum_stable_atomic_number",
+    "deuteron_binding_mev",
+    "hydrogen_stability_margin_mev",
+    "primordial_hydrogen_fraction",
+    "atomic_radius_scale",
+    "relativistic_stiffness",
+    "stellar_lifetime_scale",
+    "chemistry_viability_score",
+    "life_permitting_score",
+]
+
+
+def render_report(assessment: UniverseAssessment, verbose: bool = False, compact: bool = False) -> str:
     c = assessment.constants.as_dict()
     d = assessment.derived
+    ranked = sorted(assessment.hypotheses, key=lambda h: h.plausibility, reverse=True)
+
+    if compact:
+        changed = ", ".join(f"{k}={format_float(v)}" for k, v in c.items() if v != 1.0) or "reference universe"
+        lines = [
+            f"Universe: {changed}",
+            f"  class = {assessment.universe_class} (confidence {assessment.confidence:.2f})",
+            f"  life_permitting_score = {d['life_permitting_score']:.2f}",
+            "  top hypotheses: " + "; ".join(f"{h.name} {h.plausibility:.2f}" for h in ranked[:3]),
+        ]
+        return "\n".join(lines)
+
     lines: List[str] = ["=== Universe Reasoning Report ===", "", "Observed inputs:"]
     for key, value in c.items():
         lines.append(f"  {key} = {format_float(value)}")
 
-    core_keys = [
-        "nuclear_binding_margin",
-        "atomic_radius_scale",
-        "relativistic_stiffness",
-        "stellar_burn_rate_scale",
-        "chemistry_viability_score",
-        "life_permitting_score",
-    ]
-    verbose_keys = [key for key in d if key not in core_keys]
+    lines.extend(["", f"Effective dimensionless couplings (c convention: {assessment.effective.convention}):"])
+    for key, value in assessment.effective.as_dict().items():
+        lines.append(f"  {key} = {format_float(value)}")
+
+    verbose_keys = [key for key in d if key not in CORE_KEYS]
     lines.extend(["", "Derived intermediate quantities:"])
-    for key in core_keys + (verbose_keys if verbose else []):
+    for key in CORE_KEYS + (verbose_keys if verbose else []):
         lines.append(f"  {key} = {format_float(d[key])}")
 
     if verbose:
@@ -421,24 +802,23 @@ def render_report(assessment: UniverseAssessment, verbose: bool = False) -> str:
 
         lines.extend(["", "Major conclusions:"])
         for conclusion in assessment.conclusions:
-            lines.append(f"  - {conclusion.title}: {conclusion.statement}")
+            lines.append(textwrap.fill(f"- {conclusion.title}: {conclusion.statement}", width=92, initial_indent="  ", subsequent_indent="    "))
             lines.append("    Reasoning chain:")
             for part in conclusion.chain:
                 lines.append(textwrap.fill(f"-> {part}", width=92, initial_indent="      ", subsequent_indent="         "))
             lines.append(f"    Confidence: {conclusion.confidence:.2f}")
-            lines.append("    Assumptions: " + "; ".join(conclusion.assumptions))
+            lines.append(textwrap.fill("Assumptions: " + " ".join(conclusion.assumptions), width=92, initial_indent="    ", subsequent_indent="      "))
             if conclusion.limitations:
-                lines.append("    Limitations: " + "; ".join(conclusion.limitations))
+                lines.append(textwrap.fill("Limitations: " + " ".join(conclusion.limitations), width=92, initial_indent="    ", subsequent_indent="      "))
 
         lines.extend(["", "Competing hypotheses:"])
-        for hypothesis in sorted(assessment.hypotheses, key=lambda h: h.plausibility, reverse=True):
+        for hypothesis in ranked:
             lines.append(f"  - {hypothesis.name}: plausibility = {hypothesis.plausibility:.2f}")
-            lines.append("    Evidence for: " + "; ".join(hypothesis.evidence_for))
-            lines.append("    Evidence against: " + "; ".join(hypothesis.evidence_against))
+            lines.append(textwrap.fill("Evidence for: " + " ".join(hypothesis.evidence_for), width=92, initial_indent="    ", subsequent_indent="      "))
+            lines.append(textwrap.fill("Evidence against: " + " ".join(hypothesis.evidence_against), width=92, initial_indent="    ", subsequent_indent="      "))
     else:
-        top = sorted(assessment.hypotheses, key=lambda h: h.plausibility, reverse=True)[:3]
         lines.extend(["", "Top competing hypotheses:"])
-        for hypothesis in top:
+        for hypothesis in ranked[:3]:
             lines.append(f"  - {hypothesis.name}: {hypothesis.plausibility:.2f}")
 
     lines.extend(
@@ -461,14 +841,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--strong-force", type=positive_float, default=1.0, help="strong nuclear force multiplier")
     parser.add_argument("--speed-of-light", type=positive_float, default=1.0, help="speed of light multiplier")
-    parser.add_argument("--electron-mass", type=positive_float, default=1.0, help="electron mass multiplier")
-    parser.add_argument("--gravity", type=positive_float, default=1.0, help="gravitational strength multiplier")
+    parser.add_argument("--electron-mass", type=positive_float, default=1.0, help="electron mass multiplier (nucleon mass fixed)")
+    parser.add_argument("--gravity", type=positive_float, default=1.0, help="gravitational strength (G) multiplier")
     parser.add_argument("--fine-structure", type=positive_float, default=1.0, help="fine-structure constant multiplier")
     parser.add_argument(
         "--proton-electron-mass-ratio",
         type=positive_float,
         default=1.0,
         help="proton-to-electron mass-ratio multiplier",
+    )
+    parser.add_argument(
+        "--c-convention",
+        choices=C_CONVENTIONS,
+        default="charges-fixed",
+        help="how a change of c is interpreted: rescale all gauge couplings as 1/c, or only alpha_G",
     )
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--compact", action="store_true", help="print compact summary only")
@@ -490,8 +876,8 @@ def constants_from_args(args: argparse.Namespace) -> Constants:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    assessment = UniverseReasoner(constants_from_args(args)).analyze()
-    print(render_report(assessment, verbose=args.verbose and not args.compact))
+    assessment = UniverseReasoner(constants_from_args(args), convention=args.c_convention).analyze()
+    print(render_report(assessment, verbose=args.verbose, compact=args.compact))
     return 0
 
 
