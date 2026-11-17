@@ -132,6 +132,53 @@ class SpeedOfLightConventionTest(unittest.TestCase):
             ax.effective_parameters(ax.Constants(), "nonsense")
 
 
+class ExtrapolationTest(unittest.TestCase):
+    """Fast light under charges-fixed: every coupling 100x weaker."""
+
+    def setUp(self) -> None:
+        self.a = assess(speed_of_light=100.0)
+
+    def test_no_bound_nuclei_verdict(self) -> None:
+        self.assertEqual(self.a.universe_class, "no-bound-nuclei universe")
+        self.assertLess(self.a.derived["bound_nuclei_score"], 0.01)
+
+    def test_confidence_collapses_outside_regime(self) -> None:
+        # Regression: a 0.42 floor kept confidence near 0.25 even with regime score 0.
+        self.assertEqual(self.a.derived["reliable_regime_score"], 0.0)
+        self.assertLess(self.a.confidence, 0.05)
+
+    def test_meaningless_quantities_marked_not_applicable(self) -> None:
+        for key in ("stellar_lifetime_scale", "stellar_burn_rate_scale", "supernova_enrichment_score",
+                    "fusion_efficiency_scale", "deuteron_beta_margin_mev"):
+            self.assertIn(key, self.a.not_applicable)
+        self.assertEqual(assess().not_applicable, {})
+
+    def test_proton_mass_warning(self) -> None:
+        self.assertTrue(any("proton mass" in item for item in self.a.key_uncertainties))
+        self.assertFalse(any("proton mass" in item for item in assess().key_uncertainties))
+
+    def test_text_follows_direction_of_change(self) -> None:
+        text = ax.render_report(self.a, verbose=True)
+        self.assertIn("faster light (100x) weakens", text)
+        self.assertNotIn("slower light", text)
+        self.assertIn("No composite nucleus is bound", text)
+        self.assertIn("stellar_lifetime_scale = n/a", text)
+        slow = ax.render_report(assess(speed_of_light=0.8), verbose=True)
+        self.assertIn("slower light (0.8x) strengthens", slow)
+
+    def test_convention_cross_check(self) -> None:
+        other, other_class, _ = self.a.alternative_convention
+        self.assertEqual(other, "couplings-fixed")
+        self.assertEqual(other_class, "stable-life-friendly universe")
+        self.assertIsNone(assess().alternative_convention)
+
+    def test_convention_disagreement_lowers_confidence(self) -> None:
+        agree = ax.UniverseReasoner(ax.Constants(speed_of_light=0.5), "couplings-fixed", cross_check=False).analyze()
+        checked = assess("couplings-fixed", speed_of_light=0.5)
+        self.assertNotEqual(checked.alternative_convention[1], checked.universe_class)
+        self.assertAlmostEqual(checked.confidence, agree.confidence * 0.5, places=9)
+
+
 class CliTest(unittest.TestCase):
     def run_cli(self, *argv: str) -> str:
         buffer = io.StringIO()

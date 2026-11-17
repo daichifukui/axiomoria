@@ -56,7 +56,14 @@ Each domain is a calibrated scaling law. Our universe (all multipliers = 1) repr
 | Structure | Rees–Ostriker cooling: stars per galaxy ∝ α⁵ α_G^(−½) μ^½. |
 | Life score | Weighted **geometric** mean of chemistry, long-lived stars, hydrogen availability, structure, and stellar diversity, so any failed prerequisite dominates. |
 
-Outcome classes: stable-life-friendly, exotic-atom, short-lived-star, nuclear-matter-dominated, hydrogen-unstable, nucleosynthesis-starved, and non-viable.
+Outcome classes: stable-life-friendly, exotic-atom, short-lived-star, nuclear-matter-dominated, hydrogen-unstable, no-bound-nuclei (nothing beyond a free proton is bound), nucleosynthesis-starved (nuclei could exist but stars cannot make them), and non-viable.
+
+## Reading the confidence
+
+- **Out-of-range runs.** Confidence is multiplied by a reliability score for how far the couplings sit from the calibrated range. Runs far outside that range report confidence near 0 and flag the class as an extrapolation.
+- **Changing c.** Whenever `--speed-of-light` differs from 1, the run is repeated under the other c convention. If the two conventions give different classes, both are reported and confidence is halved.
+- **Strong coupling far from 1.** Outside roughly 0.67–1.5× today's strong coupling, a warning explains that holding the proton mass fixed is no longer justified, because the proton's mass itself comes from the strong interaction.
+- **Not-applicable quantities.** Quantities with no physical meaning in a given universe are shown as `n/a` with the reason. For example, stellar lifetimes are `n/a` when stars cannot burn hydrogen.
 
 ## Limitations
 
